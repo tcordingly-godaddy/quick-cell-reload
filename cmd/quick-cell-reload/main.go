@@ -7,9 +7,13 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/tcordingly-godaddy/quick-cell-reload/pkg/jobmeta"
+	"golang.org/x/time/rate"
 )
 
 const (
@@ -21,43 +25,47 @@ func main() {
 	var (
 		jobID      = flag.String("job", "", "Job ID to update")
 		namespace  = flag.String("namespace", defaultNamespace, "Nomad namespace")
-		listMeta   = flag.Bool("list", false, "List current meta tags for the job")
 		jobPattern = flag.String("pattern", "", "Job pattern for updating multiple jobs")
-		timeout    = flag.Duration("timeout", 30*time.Second, "Timeout for operations")
+		burst      = flag.Int("burst", 10, "Number of requests allowed in burst")
+		limit      = flag.Int("limit", 1, "Number of requests allowed per interval")
+		interval   = flag.Duration("interval", 1*time.Second, "Time interval for rate limiting")
 	)
 	flag.Parse()
 
-	if err := validateFlags(jobID, *listMeta, jobPattern); err != nil {
-		log.Fatal(err)
+	// Create rate limiter for multiple job updates
+	var limiter *rate.Limiter
+	if *jobID == "" {
+		// Only create rate limiter for multiple job updates
+		limiter = jobmeta.NewRateLimiter(*burst, *limit, *interval)
 	}
 
-	updater, err := jobmeta.NewUpdater()
+	updater, err := jobmeta.NewUpdater(limiter)
 	if err != nil {
 		log.Fatalf("Failed to create job meta updater: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	// Set up signal handling for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGTERM)
+
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := runCommand(ctx, updater, jobID, namespace, *listMeta, jobPattern); err != nil {
+	// Handle SIGTERM in a goroutine
+	go func() {
+		<-sigChan
+		log.Println("Received SIGTERM, shutting down gracefully...")
+		cancel()
+	}()
+
+	if err := runCommand(ctx, updater, jobID, namespace, jobPattern); err != nil {
 		log.Fatalf("Command failed: %v", err)
 	}
 
-	log.Println("Job meta update completed successfully")
+	log.Println("")
 }
 
-func validateFlags(jobID *string, listMeta bool, jobPattern *string) error {
-	if listMeta && *jobID == "" {
-		return fmt.Errorf("-list requires -job to be specified")
-	}
-
-	return nil
-}
-
-func runCommand(ctx context.Context, updater *jobmeta.Updater, jobID, namespace *string, listMeta bool, jobPattern *string) error {
-	if listMeta {
-		return updater.ListJobMeta(*jobID, *namespace)
-	}
+func runCommand(ctx context.Context, updater *jobmeta.Updater, jobID, namespace *string, jobPattern *string) error {
 
 	// Generate a new reload hash
 	reloadHash, err := generateReloadHash()
@@ -78,7 +86,8 @@ func runCommand(ctx context.Context, updater *jobmeta.Updater, jobID, namespace 
 		return updater.UpdateMultipleJobs(ctx, *namespace, pattern, metaUpdates)
 	}
 
-	return updater.UpdateJobMeta(ctx, *jobID, *namespace, metaUpdates)
+	updater.UpdateJobMeta(ctx, *jobID, *namespace, metaUpdates)
+	return nil
 }
 
 func generateReloadHash() (string, error) {

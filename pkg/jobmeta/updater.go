@@ -5,18 +5,20 @@ import (
 	"fmt"
 	"log"
 	"strings"
-	"time"
+	"sync"
 
 	"github.com/hashicorp/nomad/api"
+	"golang.org/x/time/rate"
 )
 
 // Updater handles updating meta tags in Nomad jobs
 type Updater struct {
-	client *api.Client
+	client  *api.Client
+	limiter *rate.Limiter
 }
 
 // NewUpdater creates a new JobMetaUpdater instance
-func NewUpdater() (*Updater, error) {
+func NewUpdater(limiter *rate.Limiter) (*Updater, error) {
 	config := api.DefaultConfig()
 	client, err := api.NewClient(config)
 	if err != nil {
@@ -24,18 +26,20 @@ func NewUpdater() (*Updater, error) {
 	}
 
 	return &Updater{
-		client: client,
+		client:  client,
+		limiter: limiter,
 	}, nil
 }
 
 // UpdateJobMeta updates the meta tags of a specific job and submits the update
-func (u *Updater) UpdateJobMeta(ctx context.Context, jobID, namespace string, metaUpdates map[string]string) error {
+func (u *Updater) UpdateJobMeta(ctx context.Context, jobID, namespace string, metaUpdates map[string]string) {
 	// Get the current job
 	job, _, err := u.client.Jobs().Info(jobID, &api.QueryOptions{
 		Namespace: namespace,
 	})
 	if err != nil {
-		return fmt.Errorf("failed to get job %s: %w", jobID, err)
+		log.Printf("failed to get job %s: %v", jobID, err)
+		return
 	}
 
 	// Initialize meta map if it doesn't exist
@@ -46,7 +50,6 @@ func (u *Updater) UpdateJobMeta(ctx context.Context, jobID, namespace string, me
 	// Update the meta tags
 	for key, value := range metaUpdates {
 		job.Meta[key] = value
-		log.Printf("Setting meta tag %s = %s", key, value)
 	}
 
 	// Submit the job update
@@ -56,90 +59,58 @@ func (u *Updater) UpdateJobMeta(ctx context.Context, jobID, namespace string, me
 
 	response, _, err := u.client.Jobs().Register(job, writeOpts)
 	if err != nil {
-		return fmt.Errorf("failed to register job update: %w", err)
+		log.Printf("failed to register job update: %v", err)
+		return
 	}
 
-	log.Printf("Job update submitted successfully. Evaluation ID: %s", response.EvalID)
-	return nil
+	log.Printf("Job %s update submitted successfully. Evaluation ID: %s", jobID, response.EvalID)
 }
 
-// ListJobMeta displays the current meta tags for a job
-func (u *Updater) ListJobMeta(jobID, namespace string) error {
-	job, _, err := u.client.Jobs().Info(jobID, &api.QueryOptions{
+func (u *Updater) GetJobs(ctx context.Context, namespace string, jobPattern string) ([]*api.JobListStub, error) {
+	jobs, _, err := u.client.Jobs().List(&api.QueryOptions{
 		Namespace: namespace,
 	})
 	if err != nil {
-		return fmt.Errorf("failed to get job %s: %w", jobID, err)
+		return nil, fmt.Errorf("failed to list jobs: %w", err)
 	}
 
-	if job.Meta == nil || len(job.Meta) == 0 {
-		fmt.Printf("No meta tags found for job %s\n", jobID)
-		return nil
+	matchingJobs := make([]*api.JobListStub, 0)
+	for _, jobStub := range jobs {
+		// Check if job matches pattern (simple prefix matching for now)
+		if strings.HasPrefix(jobStub.ID, jobPattern) {
+			matchingJobs = append(matchingJobs, jobStub)
+		}
 	}
-
-	fmt.Printf("Meta tags for job %s:\n", jobID)
-	for key, value := range job.Meta {
-		fmt.Printf("  %s = %s\n", key, value)
-	}
-
-	return nil
+	return matchingJobs, nil
 }
 
 // UpdateMultipleJobs updates meta tags for multiple jobs based on a pattern or list
 func (u *Updater) UpdateMultipleJobs(ctx context.Context, namespace string, jobPattern string, metaUpdates map[string]string) error {
 	// List jobs in the namespace
-	jobs, _, err := u.client.Jobs().List(&api.QueryOptions{
-		Namespace: namespace,
-	})
+	jobs, err := u.GetJobs(ctx, namespace, jobPattern)
 	if err != nil {
 		return fmt.Errorf("failed to list jobs: %w", err)
 	}
 
-	updatedCount := 0
+	log.Printf("Found %d jobs to update", len(jobs))
+	wg := sync.WaitGroup{}
 	for _, jobStub := range jobs {
-		// Check if job matches pattern (simple prefix matching for now)
-		if strings.HasPrefix(jobStub.ID, jobPattern) {
-			log.Printf("Updating job: %s", jobStub.ID)
-			if err := u.UpdateJobMeta(ctx, jobStub.ID, namespace, metaUpdates); err != nil {
-				log.Printf("Failed to update job %s: %v", jobStub.ID, err)
-				continue
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if u.limiter != nil {
+				if err := u.limiter.Wait(ctx); err != nil {
+					log.Printf("failed to wait for permission: %v", err)
+					return
+				}
 			}
-			updatedCount++
-		}
+			u.UpdateJobMeta(ctx, jobStub.ID, namespace, metaUpdates)
+		}()
 	}
 
-	log.Printf("Updated %d jobs", updatedCount)
+	log.Print("Waiting for jobs to finish")
+	wg.Wait()
+	log.Printf("Finish sending requests %d jobs", len(jobs))
 	return nil
-}
-
-// WaitForEvaluation waits for a Nomad evaluation to complete
-func (u *Updater) WaitForEvaluation(evalID string, timeout time.Duration) error {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("timeout waiting for evaluation %s", evalID)
-		case <-ticker.C:
-			eval, _, err := u.client.Evaluations().Info(evalID, nil)
-			if err != nil {
-				log.Printf("Error checking evaluation status: %v", err)
-				continue
-			}
-
-			switch eval.Status {
-			case "complete":
-				log.Printf("Evaluation %s completed successfully", evalID)
-				return nil
-			case "failed":
-				return fmt.Errorf("evaluation %s failed", evalID)
-			default:
-				log.Printf("Evaluation %s status: %s", evalID, eval.Status)
-			}
-		}
-	}
 }
